@@ -121,6 +121,7 @@ def stack(tmp_path):
         "api": api_svc, "keys": key_svc, "client": client,
         "key_client": key_client, "data_dir": api_data,
         "blob_dir": api_data / "blobs",
+        "key_db": str(key_db / "keystore.db"),
     }
     client.close()
     key_client.close()

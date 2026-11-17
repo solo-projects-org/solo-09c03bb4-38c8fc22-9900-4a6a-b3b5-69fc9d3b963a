@@ -33,8 +33,11 @@ AES-256-GCM 信封包裹；支持主密钥在线轮换：只迁移密钥信封�
 | 信封 DEK（密文） | API 的 SQLite `images.wrapped_dek` | — |
 | 原片密文 | API 卷 `/data/blobs/*.msef`（AES-256-GCM 分帧） | — |
 
-销毁主密钥 = 密钥库中密钥材料被零覆写并置 `destroyed`，密码学意义不可恢复；
-对已销毁 MK 的 `unwrap/rewrap` 返回 `410 key_destroyed`。
+销毁主密钥 = 密钥库中密钥材料被零覆写、**并已从持久卷数据库与 WAL/SHM/
+回滚日志中清退核实**，才置 `lifecycle=purged` 并报告销毁完成；未核实前
+`state=destroyed` 只表示不可再解包，`unwrap/rewrap` 返回 `410 key_destroyed`，
+destroy 接口返回 `503 key_purge_blocked`。清退阶段持久化在密钥服务卷内，
+进程中断/清理受阻后重启会自动接续，不会重报"已完成"。
 
 ## 快速启动
 
@@ -88,7 +91,10 @@ watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 2. 后台常驻线程逐行把旧 MK 包裹的 DEK 调密钥服务 `rewrap` 改包到新 MK，
    **只更新元数据里的 64 字节信封，blob 密文正文逐字节不动**。
 3. 销毁前两次零残留核验（扫描后 + 销毁前），确认没有 `ready/receiving` 行
-   仍依赖旧 MK，才调用销毁；销毁后再用只读 `status` 核实，**不提前报完成**。
+   仍依赖旧 MK，才调用销毁；销毁必须等到密钥服务把持久卷数据库及
+   WAL/SHM/日志文件中的旧密钥材料清退并只读核实（`lifecycle=purged`）后
+   才报 completed。清退受阻（503）时作业停在 `destroying` 持续重试，
+   重启后自动接续，**绝不提前报完成**。
 4. **在途下载**：下载开始时只向密钥服务解包一次 DEK，之后帧解密完全在 API
    进程内存完成；即使下载很慢、期间旧 MK 被销毁，下载仍完整成功。
 5. **在途上传**：上传期间发生轮换时，finalize 会先 rewrap 改绑当前 MK 再发布；
@@ -105,25 +111,32 @@ watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 | 变量 | 作用 |
 |---|---|
 | `KEY_OP_DELAY=0.3` | 每个密钥操作人为延迟 0.3s，模拟慢密钥服务 |
-| `KEY_DESTROY_DROP_RECEIPT=true` | 销毁成功落盘后故意不回完整 HTTP 响应，模拟销毁后丢回执 |
+| `KEY_DESTROY_DROP_RECEIPT=true` | 销毁**与清退均已完成**后故意不回完整 HTTP 响应，模拟销毁后丢回执 |
+| `KEY_PURGE_BLOCK_PHASE=compacted` | 让指定清退阶段总是失败，演练"清理受阻 + 不报完成 + 重启接续" |
+| `KEY_PURGE_WAIT_SECONDS=10` | destroy 请求等待清退核实的秒数，超时返回 503（阶段保留） |
+| `KEY_PURGE_SCRUB_PASSES=3` | WAL/SHM/journal 等旁路文件覆写遍数 |
 
 ```bash
 KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
+KEY_PURGE_BLOCK_PHASE=compacted docker compose up --build keystore
 ```
 
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（27 项，含离线加密单测）
 python -m pytest tests/ -q
 ```
 
 覆盖：逐字节往返（空文件/跨帧/多帧、密文布局尺寸）、信封 AAD/错钥拒绝、
 明文不落盘（blob/元数据库/临时文件三处核查）、幂等上传与密钥操作幂等、
-篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读）、
-进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
-双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
-跨越轮换的上传自动改绑。
+篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读、
+销毁后卷上无旧密钥材料）、进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、
+销毁丢回执自动核实、双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
+跨越轮换的上传自动改绑；以及清退缺口专项：清理受阻时 destroy 返回 503 且
+轮换作业不报 completed、旧密钥仍 410、新片/已改包片照常存取、
+解除受阻后续退完成，清退途中进程被终止后重启从持久化阶段继续，
+旧版本遗留（WAL 中仍有已销毁密钥）升级后自动补清退。
 
 ## 限制与生产化建议（见 docs/ 下说明）
 

@@ -15,6 +15,13 @@ services:
       KEY_OP_DELAY: "${KEY_OP_DELAY:-0}"
       # 销毁主密钥成功后故意丢弃 HTTP 回执（演练回执丢失自动核实接续）
       KEY_DESTROY_DROP_RECEIPT: "${KEY_DESTROY_DROP_RECEIPT:-false}"
+      # 清退受阻演练：指定阶段总是失败（zero_material/single_file/compacted/
+      # shredded/restored），用于验证"不报销毁完成 + 重启接续"
+      KEY_PURGE_BLOCK_PHASE: "${KEY_PURGE_BLOCK_PHASE:-}"
+      # destroy 请求等待清退核实的秒数，超时返回 503（阶段保留，可接续）
+      KEY_PURGE_WAIT_SECONDS: "${KEY_PURGE_WAIT_SECONDS:-10}"
+      # WAL/SHM/journal 等旁路文件覆写遍数
+      KEY_PURGE_SCRUB_PASSES: "${KEY_PURGE_SCRUB_PASSES:-3}"
       KEYSTORE_DB: "/data/keystore.db"
     volumes:
       - keystore-data:/data

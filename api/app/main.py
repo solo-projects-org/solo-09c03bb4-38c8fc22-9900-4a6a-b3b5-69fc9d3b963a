@@ -68,12 +68,27 @@ async def lifespan(app: FastAPI):
         for key in key_status.get("keys", []):
             if (key["key_id"] != current_mk
                     and key["state"] == "active"
-                    and not db.has_rotation_for(key["key_id"])):
+                    and not db.has_rotation_for(key["key_id"])
+                    and db.active_rotation() is None):
                 job_id = db.create_rotation(
                     key["key_id"], current_mk,
                     db.count_under_key(key["key_id"], only_migratable=True))
                 print(f"[startup] reconciled missing rotation job {job_id} "
                       f"for {key['key_id']}")
+        # 上次销毁已生效但清退未完成：补建/恢复作业，让后台继续核退并
+        # 在核实后才置 completed（进程中断不丢可接续状态）。
+        for key in key_status.get("keys", []):
+            if (key["key_id"] != current_mk
+                    and key["state"] == "destroyed"
+                    and key.get("lifecycle") != "purged"
+                    and not db.has_rotation_for(key["key_id"])
+                    and db.active_rotation() is None):
+                job_id = db.create_rotation(key["key_id"], current_mk,
+                                            db.count_under_key(key["key_id"]))
+                db.bump_rotation(job_id, state="destroying")
+                print(f"[startup] resumed unfinished key purge via job "
+                      f"{job_id} for {key['key_id']} "
+                      f"(phase={key.get('purge_phase')})")
     except KeyServiceError as exc:
         print(f"[startup] rotation reconciliation skipped: {exc}")
     worker = RotationWorker(db, keys, main_loop)
@@ -376,7 +391,8 @@ async def rotation_status(job_id: str):
 def _rotation_view(job: dict) -> dict:
     total = max(job["total"], job["migrated"] + job["failed"], 1)
     pct = round(100.0 * (job["migrated"] + job["failed"]) / total, 2)
-    return {**{k: v for k, v in job.items()}, "progress_percent": pct}
+    return {**{k: v for k, v in job.items()}, "progress_percent": pct,
+            "purge_confirmed": job["state"] == "completed"}
 
 
 @app.get("/keys/status", summary="密钥视角状态（代理密钥服务只读接口）")

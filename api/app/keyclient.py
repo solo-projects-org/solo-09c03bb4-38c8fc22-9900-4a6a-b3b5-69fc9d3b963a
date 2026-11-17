@@ -52,6 +52,17 @@ class KeyClient:
                 await asyncio.sleep(min(0.25 * (2 ** attempt), 4.0))
                 continue
             if resp.status_code >= 500:
+                # 清退受阻是"已提交、未完成"的确定性结果：密钥服务已经等过
+                # 自己的清退窗口，API 直接保留 destroying 稍后重试即可，
+                # 不应在这里反复重放导致长时间阻塞。
+                try:
+                    detail = resp.json().get("detail", {})
+                except Exception:
+                    detail = {}
+                if isinstance(detail, dict) and detail.get("code") == "key_purge_blocked":
+                    raise KeyServiceError(resp.status_code,
+                                          detail["code"],
+                                          detail.get("message", ""))
                 last_exc = KeyServiceError(resp.status_code, "key_service_5xx",
                                            resp.text[:200])
                 await asyncio.sleep(min(0.25 * (2 ** attempt), 4.0))
@@ -78,6 +89,9 @@ class KeyClient:
     async def master_status(self) -> dict:
         return await self._request("GET", "/internal/master/status")
 
+    async def purge_pending(self) -> dict:
+        return await self._request("GET", "/internal/purge/pending")
+
     async def rotate_master(self) -> dict:
         # 同一幂等令牌贯穿重试，避免响应丢失后重复生成主密钥
         token = f"rotate-{uuid.uuid4()}"
@@ -86,17 +100,30 @@ class KeyClient:
             headers={"X-Idempotency-Token": token})
 
     async def destroy_master(self, key_id: str) -> dict:
-        """销毁主密钥。回执可能丢失，故先查状态核实；销毁是幂等的。"""
+        """销毁主密钥，必须核实"密钥材料已从持久卷清退"才算成功。
+
+        密钥服务在清退未核实前返回 503 key_purge_blocked；回执丢失时用只读
+        status 核实。只有 lifecycle=purged 才视为销毁完成——destroyed 行内
+        零覆写但 WAL/日志/空闲页尚未清退时，不得报完成。
+        """
         try:
             return await self._request(
                 "POST", "/internal/master/destroy", json={"key_id": key_id})
         except KeyServiceError as exc:
-            status = await self.master_status()
+            if exc.status_code not in (503, 502) \
+                    and exc.code != "key_service_unreachable":
+                raise
+            # 回执丢失或清退受阻：以只读状态核实真实进度后再下结论
+            try:
+                status = await self.master_status()
+            except KeyServiceError:
+                raise exc
             for k in status.get("keys", []):
-                if k["key_id"] == key_id and k["state"] == "destroyed":
+                if k["key_id"] == key_id and k.get("lifecycle") == "purged":
                     return {"key_id": key_id, "state": "destroyed",
+                            "lifecycle": "purged",
                             "verified_after_lost_receipt": True}
-            raise exc
+            raise
 
     async def generate_dek(self) -> dict:
         return await self._request("POST", "/internal/dek/generate")
